@@ -38,6 +38,38 @@ void main() {
     expect(compact(1500000), '1.5M');
   });
 
+  test('detail parsing: quants, params, gated', () {
+    final d = HfModelDetail.fromJson({
+      'gguf': {'total': 3645856513, 'architecture': 'dspark', 'context_length': 4096},
+      'cardData': {'base_model': 'Qwen/Qwen3.6-27B'},
+      'gated': false,
+      'siblings': [
+        {'rfilename': 'README.md', 'size': 100},
+        {'rfilename': 'm-Q2_0.gguf', 'size': 700},
+        {'rfilename': 'm-Q8_0-00001-of-00002.gguf', 'size': 400},
+        {'rfilename': 'm-Q8_0-00002-of-00002.gguf', 'size': 500},
+        {'rfilename': 'm.F16.gguf', 'size': 1600},
+        {'rfilename': 'm-f16-extra.gguf', 'size': 100},
+      ],
+    });
+    expect(d.paramCount, 3645856513);
+    expect(d.architecture, 'dspark');
+    expect(d.contextLength, 4096);
+    expect(d.baseModels, ['Qwen/Qwen3.6-27B']);
+    expect(d.gated, false);
+    expect(d.fileCount, 6);
+    final quants = {for (final (n, s) in d.quants) n: s};
+    expect(quants, {'Q2_0': 700, 'Q8_0': 900, 'F16': 1700});
+  });
+
+  test('params and bytes labels', () {
+    expect(paramsLabel(3645856513), '3.6B');
+    expect(paramsLabel(27000000000), '27B');
+    expect(paramsLabel(770000000), '770M');
+    expect(bytesLabel(7291885792), '6.8 GB');
+    expect(bytesLabel(38400000), '37 MB');
+  });
+
   test('timeAgo buckets', () {
     final now = DateTime.now();
     expect(timeAgo(null), '');

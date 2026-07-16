@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
 
@@ -57,6 +58,104 @@ class HfModel {
   }
 }
 
+/// Full metadata for one model from GET /api/models/{id}?blobs=true.
+class HfModelDetail {
+  final int? paramCount; // from safetensors or gguf totals
+  final String? architecture;
+  final int? contextLength;
+  final List<String> baseModels;
+  final List<String> datasets;
+  final List<String> languages;
+  final DateTime? lastModified;
+  final int? usedStorage;
+  final int fileCount;
+  final int spacesCount;
+  final bool gated;
+  final List<(String, int)> quants; // (quant name, total bytes) for .gguf repos
+
+  const HfModelDetail({
+    this.paramCount,
+    this.architecture,
+    this.contextLength,
+    this.baseModels = const [],
+    this.datasets = const [],
+    this.languages = const [],
+    this.lastModified,
+    this.usedStorage,
+    this.fileCount = 0,
+    this.spacesCount = 0,
+    this.gated = false,
+    this.quants = const [],
+  });
+
+  factory HfModelDetail.fromJson(Map<String, dynamic> json) {
+    final card = json['cardData'] as Map<String, dynamic>? ?? {};
+    final gguf = json['gguf'] as Map<String, dynamic>?;
+    final safetensors = json['safetensors'] as Map<String, dynamic>?;
+    final config = json['config'] as Map<String, dynamic>?;
+    final siblings = (json['siblings'] as List? ?? []).cast<Map<String, dynamic>>();
+
+    List<String> asList(dynamic v) =>
+        v == null ? const [] : (v is List ? v.cast<String>() : [v as String]);
+
+    // group .gguf files by quantization token (Q4_K_M, F16, PQ2_0...),
+    // summing multi-part files
+    final quantRe = RegExp(r'^(I?Q|F|BF|PQ|TQ)\d', caseSensitive: false);
+    final quants = <String, int>{};
+    for (final s in siblings) {
+      final name = s['rfilename'] as String;
+      if (!name.endsWith('.gguf')) continue;
+      final parts = name
+          .substring(0, name.length - 5)
+          .split(RegExp(r'[-.]'))
+          .where((p) => quantRe.hasMatch(p));
+      if (parts.isEmpty) continue;
+      final key = parts.last.toUpperCase();
+      quants[key] = (quants[key] ?? 0) + ((s['size'] as num?)?.toInt() ?? 0);
+    }
+
+    return HfModelDetail(
+      paramCount: ((safetensors?['total'] ?? gguf?['total']) as num?)?.toInt(),
+      architecture:
+          (config?['architectures'] as List?)?.cast<String>().firstOrNull ??
+              gguf?['architecture'] as String?,
+      contextLength: (gguf?['context_length'] as num?)?.toInt(),
+      baseModels: asList(card['base_model']),
+      datasets: asList(card['datasets']),
+      languages: asList(card['language']),
+      lastModified: DateTime.tryParse(json['lastModified'] as String? ?? ''),
+      usedStorage: (json['usedStorage'] as num?)?.toInt(),
+      fileCount: siblings.length,
+      spacesCount: (json['spaces'] as List? ?? []).length,
+      gated: json['gated'] != false && json['gated'] != null,
+      quants: quants.entries.map((e) => (e.key, e.value)).toList()
+        ..sort((a, b) => a.$2.compareTo(b.$2)),
+    );
+  }
+}
+
+Future<HfModelDetail> fetchModelDetail(String id) async {
+  final uri = Uri.https('huggingface.co', '/api/models/$id', {'blobs': 'true'});
+  final res = await http.get(uri).timeout(const Duration(seconds: 15));
+  if (res.statusCode != 200) {
+    throw Exception('Hugging Face returned ${res.statusCode}');
+  }
+  return HfModelDetail.fromJson(jsonDecode(res.body) as Map<String, dynamic>);
+}
+
+/// Model card markdown with the YAML frontmatter stripped.
+Future<String> fetchReadme(String id) async {
+  final uri = Uri.https('huggingface.co', '/$id/raw/main/README.md');
+  final res = await http.get(uri).timeout(const Duration(seconds: 15));
+  if (res.statusCode != 200) return '';
+  var md = res.body;
+  if (md.startsWith('---')) {
+    final end = md.indexOf('\n---', 3);
+    if (end != -1) md = md.substring(end + 4);
+  }
+  return md.trim();
+}
+
 enum Feed {
   trending('Trending', 'trendingScore'),
   top('Top', 'likes'),
@@ -92,6 +191,24 @@ String compact(int n) {
   if (n >= 1000) return '${(n / 1000).toStringAsFixed(n >= 10000 ? 0 : 1)}k';
   return '$n';
 }
+
+/// "27B", "1.5B", "770M" — parameter counts.
+String paramsLabel(int n) {
+  if (n >= 1000000000) return '${(n / 1e9).toStringAsFixed(n >= 10000000000 ? 0 : 1)}B';
+  if (n >= 1000000) return '${(n / 1e6).toStringAsFixed(0)}M';
+  return '$n';
+}
+
+String bytesLabel(int n) {
+  if (n >= 1 << 30) return '${(n / (1 << 30)).toStringAsFixed(1)} GB';
+  if (n >= 1 << 20) return '${(n / (1 << 20)).toStringAsFixed(0)} MB';
+  return '${(n / 1024).toStringAsFixed(0)} kB';
+}
+
+const _months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+String dateLabel(DateTime? t) =>
+    t == null ? '—' : '${t.day} ${_months[t.month - 1]} ${t.year}';
 
 String timeAgo(DateTime? t) {
   if (t == null) return '';
@@ -306,14 +423,8 @@ class _FeedPageState extends State<FeedPage> {
 
   void _showDetail(BuildContext context, HfModel model) {
     HapticFeedback.selectionClick();
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Theme.of(context).colorScheme.surfaceContainerHighest,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
-      builder: (_) => _DetailSheet(model: model),
+    Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => ModelDetailPage(model: model)),
     );
   }
 }
@@ -498,99 +609,277 @@ class _ModelRow extends StatelessWidget {
 }
 
 // ---------------------------------------------------------------------------
-// Detail sheet
+// Model detail page — full metadata, quantizations, and the model card.
 // ---------------------------------------------------------------------------
 
-class _DetailSheet extends StatelessWidget {
+class ModelDetailPage extends StatefulWidget {
   final HfModel model;
 
-  const _DetailSheet({required this.model});
+  const ModelDetailPage({super.key, required this.model});
+
+  @override
+  State<ModelDetailPage> createState() => _ModelDetailPageState();
+}
+
+class _ModelDetailPageState extends State<ModelDetailPage> {
+  late final Future<HfModelDetail> _detail = fetchModelDetail(widget.model.id);
+  late final Future<String> _readme = fetchReadme(widget.model.id);
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final model = widget.model;
     final tagColor = pipelineColor(model.pipelineTag, scheme.brightness);
     final cleanTags =
-        model.tags.where((t) => !t.contains(':')).take(14).toList();
+        model.tags.where((t) => !t.contains(':')).take(16).toList();
 
-    return SafeArea(
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Center(
-              child: Container(
-                width: 36,
-                height: 4,
-                decoration: BoxDecoration(
-                  color: scheme.outlineVariant,
-                  borderRadius: BorderRadius.circular(2),
-                ),
-              ),
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(model.name,
+            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.open_in_new, size: 20),
+            tooltip: 'Open on Hugging Face',
+            onPressed: () =>
+                launchUrl(model.url, mode: LaunchMode.externalApplication),
+          ),
+        ],
+      ),
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(20, 4, 20, 32),
+        children: [
+          Text(model.owner,
+              style: TextStyle(fontSize: 14, color: scheme.onSurfaceVariant)),
+          Text(
+            model.name,
+            style: TextStyle(
+              fontSize: 24,
+              fontWeight: FontWeight.w800,
+              letterSpacing: -0.5,
+              height: 1.2,
+              color: scheme.onSurface,
             ),
-            const SizedBox(height: 18),
-            Text(
-              model.owner,
-              style: TextStyle(fontSize: 14, color: scheme.onSurfaceVariant),
-            ),
-            Text(
-              model.name,
-              style: TextStyle(
-                fontSize: 22,
-                fontWeight: FontWeight.w800,
-                letterSpacing: -0.5,
-                height: 1.2,
-                color: scheme.onSurface,
-              ),
-            ),
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              _Stat(
+                  label: 'trending',
+                  value: '▲ ${compact(model.trendingScore)}',
+                  color: scheme.primary),
+              _Stat(label: 'likes', value: compact(model.likes)),
+              _Stat(label: 'downloads', value: compact(model.downloads)),
+              _Stat(label: 'created', value: timeAgo(model.createdAt)),
+            ],
+          ),
+          const SizedBox(height: 14),
+          Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            children: [
+              if (model.pipelineTag != null)
+                _Pill(text: model.pipelineTag!, dot: tagColor),
+              if (model.library != null) _Pill(text: model.library!),
+              if (model.license != null) _Pill(text: '${model.license} license'),
+            ],
+          ),
+          FutureBuilder<HfModelDetail>(
+            future: _detail,
+            builder: (context, snap) {
+              final d = snap.data;
+              if (d == null) return const SizedBox(height: 8);
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const SizedBox(height: 10),
+                  if (d.paramCount != null)
+                    _InfoRow('Parameters', paramsLabel(d.paramCount!)),
+                  if (d.architecture != null)
+                    _InfoRow('Architecture', d.architecture!),
+                  if (d.contextLength != null)
+                    _InfoRow('Context length', compact(d.contextLength!)),
+                  _InfoRow('Created', dateLabel(model.createdAt)),
+                  _InfoRow('Last updated',
+                      '${dateLabel(d.lastModified)} · ${timeAgo(d.lastModified)}'),
+                  if (d.baseModels.isNotEmpty)
+                    _InfoRow('Base model', d.baseModels.join(', ')),
+                  if (d.languages.isNotEmpty)
+                    _InfoRow('Languages', d.languages.take(8).join(', ')),
+                  if (d.datasets.isNotEmpty)
+                    _InfoRow('Datasets', d.datasets.take(5).join(', ')),
+                  if (d.usedStorage != null)
+                    _InfoRow('Repository',
+                        '${d.fileCount} files · ${bytesLabel(d.usedStorage!)}'),
+                  if (d.spacesCount > 0)
+                    _InfoRow('Used in', '${d.spacesCount} spaces'),
+                  if (d.gated) const _InfoRow('Access', 'gated — requires approval'),
+                  if (d.quants.isNotEmpty) ...[
+                    const SizedBox(height: 14),
+                    const _SectionHeader('QUANTIZATIONS'),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 6,
+                      runSpacing: 6,
+                      children: [
+                        for (final (name, size) in d.quants)
+                          _Pill(text: '$name · ${bytesLabel(size)}'),
+                      ],
+                    ),
+                  ],
+                ],
+              );
+            },
+          ),
+          if (cleanTags.isNotEmpty) ...[
             const SizedBox(height: 14),
-            Row(
-              children: [
-                _Stat(
-                    label: 'trending',
-                    value: '▲ ${compact(model.trendingScore)}',
-                    color: scheme.primary),
-                _Stat(label: 'likes', value: compact(model.likes)),
-                _Stat(label: 'downloads', value: compact(model.downloads)),
-                _Stat(label: 'created', value: timeAgo(model.createdAt)),
-              ],
-            ),
-            const SizedBox(height: 16),
+            const _SectionHeader('TAGS'),
+            const SizedBox(height: 8),
             Wrap(
               spacing: 6,
               runSpacing: 6,
-              children: [
-                if (model.pipelineTag != null)
-                  _Pill(text: model.pipelineTag!, dot: tagColor),
-                if (model.library != null) _Pill(text: model.library!),
-                if (model.license != null)
-                  _Pill(text: '${model.license} license'),
-                for (final t in cleanTags) _Pill(text: t),
-              ],
-            ),
-            const SizedBox(height: 20),
-            SizedBox(
-              width: double.infinity,
-              child: FilledButton(
-                style: FilledButton.styleFrom(
-                  backgroundColor: hfYellow,
-                  foregroundColor: Colors.black,
-                  padding: const EdgeInsets.symmetric(vertical: 14),
-                  shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12)),
-                ),
-                onPressed: () =>
-                    launchUrl(model.url, mode: LaunchMode.externalApplication),
-                child: const Text(
-                  'Open on Hugging Face',
-                  style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
-                ),
-              ),
+              children: [for (final t in cleanTags) _Pill(text: t)],
             ),
           ],
-        ),
+          const SizedBox(height: 20),
+          Divider(color: scheme.outlineVariant),
+          const SizedBox(height: 12),
+          const _SectionHeader('MODEL CARD'),
+          const SizedBox(height: 8),
+          FutureBuilder<String>(
+            future: _readme,
+            builder: (context, snap) {
+              if (!snap.hasData) {
+                return const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 32),
+                  child: Center(
+                    child: CircularProgressIndicator(
+                        strokeWidth: 2.5, color: hfYellow),
+                  ),
+                );
+              }
+              if (snap.data!.isEmpty) {
+                return Text('This model has no card.',
+                    style: TextStyle(color: scheme.onSurfaceVariant));
+              }
+              return MarkdownBody(
+                data: snap.data!,
+                imageDirectory: 'https://huggingface.co/${model.id}/resolve/main/',
+                onTapLink: (text, href, title) {
+                  if (href == null) return;
+                  final uri = Uri.parse(href);
+                  launchUrl(
+                    uri.hasScheme
+                        ? uri
+                        : Uri.parse('https://huggingface.co/${model.id}/blob/main/$href'),
+                    mode: LaunchMode.externalApplication,
+                  );
+                },
+                styleSheet: _markdownStyle(scheme),
+              );
+            },
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+MarkdownStyleSheet _markdownStyle(ColorScheme scheme) {
+  final code = TextStyle(
+    fontFamily: 'Menlo',
+    fontFamilyFallback: const ['monospace'],
+    fontSize: 12.5,
+    height: 1.5,
+    color: scheme.onSurface,
+    backgroundColor: scheme.surfaceContainerHighest,
+  );
+  TextStyle h(double size) => TextStyle(
+        fontSize: size,
+        fontWeight: FontWeight.w800,
+        letterSpacing: -0.3,
+        height: 1.3,
+        color: scheme.onSurface,
+      );
+  return MarkdownStyleSheet(
+    p: TextStyle(fontSize: 14.5, height: 1.55, color: scheme.onSurface),
+    h1: h(21), h2: h(18), h3: h(16), h4: h(14.5),
+    h1Padding: const EdgeInsets.only(top: 12),
+    h2Padding: const EdgeInsets.only(top: 10),
+    h3Padding: const EdgeInsets.only(top: 8),
+    a: TextStyle(color: scheme.primary, fontWeight: FontWeight.w600),
+    code: code,
+    codeblockPadding: const EdgeInsets.all(12),
+    codeblockDecoration: BoxDecoration(
+      color: scheme.surfaceContainerHighest,
+      borderRadius: BorderRadius.circular(10),
+    ),
+    blockquote: TextStyle(color: scheme.onSurfaceVariant, fontSize: 14),
+    blockquoteDecoration: BoxDecoration(
+      border: Border(left: BorderSide(color: hfYellow, width: 3)),
+    ),
+    blockquotePadding: const EdgeInsets.fromLTRB(12, 4, 0, 4),
+    listBullet: TextStyle(fontSize: 14.5, color: scheme.onSurface),
+    tableHead: TextStyle(fontWeight: FontWeight.w700, fontSize: 12.5, color: scheme.onSurface),
+    tableBody: TextStyle(fontSize: 12.5, color: scheme.onSurface),
+    tableBorder: TableBorder.all(color: scheme.outlineVariant, width: 0.5),
+    tableCellsPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+    horizontalRuleDecoration: BoxDecoration(
+      border: Border(top: BorderSide(color: scheme.outlineVariant, width: 0.5)),
+    ),
+  );
+}
+
+class _SectionHeader extends StatelessWidget {
+  final String text;
+
+  const _SectionHeader(this.text);
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(
+      text,
+      style: TextStyle(
+        fontSize: 11,
+        fontWeight: FontWeight.w700,
+        letterSpacing: 1.2,
+        color: Theme.of(context).colorScheme.onSurfaceVariant,
+      ),
+    );
+  }
+}
+
+class _InfoRow extends StatelessWidget {
+  final String label;
+  final String value;
+
+  const _InfoRow(this.label, this.value);
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 110,
+            child: Text(label,
+                style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant)),
+          ),
+          Expanded(
+            child: Text(
+              value,
+              style: TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                fontFeatures: const [FontFeature.tabularFigures()],
+                color: scheme.onSurface,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
