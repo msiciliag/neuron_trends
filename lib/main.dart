@@ -457,7 +457,7 @@ class _FeedPageState extends State<FeedPage> {
                       parent: BouncingScrollPhysics(),
                     ),
                     itemCount: models.length,
-                    separatorBuilder: (_, i) => const Divider(indent: 48),
+                    separatorBuilder: (_, i) => const Divider(),
                     itemBuilder: (context, i) => _ModelRow(
                       rank: i + 1,
                       model: models[i],
