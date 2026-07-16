@@ -269,7 +269,15 @@ ThemeData buildTheme(Brightness b) {
     useMaterial3: true,
     colorScheme: scheme,
     scaffoldBackgroundColor: scheme.surface,
-    splashFactory: InkSparkle.splashFactory,
+    splashFactory: InkRipple.splashFactory,
+    splashColor: hfYellow.withValues(alpha: 0.10),
+    highlightColor: hfYellow.withValues(alpha: 0.12),
+    // opaque right-to-left push with edge shadow on both platforms — no
+    // cross-fade "ghosting"
+    pageTransitionsTheme: const PageTransitionsTheme(builders: {
+      TargetPlatform.android: CupertinoPageTransitionsBuilder(),
+      TargetPlatform.iOS: CupertinoPageTransitionsBuilder(),
+    }),
     appBarTheme: AppBarTheme(
       backgroundColor: scheme.surface,
       surfaceTintColor: Colors.transparent,
@@ -312,22 +320,49 @@ class FeedPage extends StatefulWidget {
 
 class _FeedPageState extends State<FeedPage> {
   Feed _feed = Feed.trending;
-  late Future<List<HfModel>> _future = fetchModels(_feed);
+  List<HfModel>? _models; // last successfully loaded list, kept while reloading
+  bool _loading = false;
+  bool _failed = false;
+  int _reqId = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final id = ++_reqId;
+    setState(() {
+      _loading = true;
+      _failed = false;
+    });
+    try {
+      final models = await fetchModels(_feed);
+      if (!mounted || id != _reqId) return;
+      setState(() {
+        _models = models;
+        _loading = false;
+      });
+    } catch (_) {
+      if (!mounted || id != _reqId) return;
+      setState(() {
+        _loading = false;
+        _failed = true;
+      });
+    }
+  }
 
   Future<void> _refresh() {
     HapticFeedback.lightImpact();
-    final f = fetchModels(_feed);
-    setState(() => _future = f);
-    return f.then((_) {}, onError: (_) {});
+    return _load();
   }
 
   void _setFeed(Feed feed) {
     if (feed == _feed) return;
     HapticFeedback.selectionClick();
-    setState(() {
-      _feed = feed;
-      _future = fetchModels(feed);
-    });
+    _feed = feed;
+    _load();
   }
 
   @override
@@ -388,38 +423,54 @@ class _FeedPageState extends State<FeedPage> {
           ),
         ),
       ),
-      body: FutureBuilder<List<HfModel>>(
-        future: _future,
-        builder: (context, snap) {
-          if (snap.hasError) {
-            return _ErrorView(onRetry: _refresh);
-          }
-          if (!snap.hasData) {
-            return const Center(
-              child:
-                  CircularProgressIndicator(strokeWidth: 2.5, color: hfYellow),
-            );
-          }
-          final models = snap.data!;
-          return RefreshIndicator(
-            onRefresh: _refresh,
-            color: scheme.primary,
-            child: ListView.separated(
-              physics: const AlwaysScrollableScrollPhysics(
-                parent: BouncingScrollPhysics(),
-              ),
-              itemCount: models.length,
-              separatorBuilder: (_, i) => const Divider(indent: 52),
-              itemBuilder: (context, i) => _ModelRow(
-                rank: i + 1,
-                model: models[i],
-                feed: _feed,
-                onTap: () => _showDetail(context, models[i]),
+      body: Builder(builder: (context) {
+        final models = _models;
+        if (models == null) {
+          return _failed
+              ? _ErrorView(onRetry: _refresh)
+              : const Center(
+                  child: CircularProgressIndicator(
+                      strokeWidth: 2.5, color: hfYellow),
+                );
+        }
+        // keep the previous list on screen while a new feed loads: dim it
+        // slightly instead of flashing a spinner
+        return Column(
+          children: [
+            SizedBox(
+              height: 2,
+              child: _loading
+                  ? const LinearProgressIndicator(
+                      color: hfYellow, backgroundColor: Colors.transparent)
+                  : null,
+            ),
+            Expanded(
+              child: AnimatedOpacity(
+                opacity: _loading ? 0.45 : 1,
+                duration: const Duration(milliseconds: 180),
+                curve: Curves.easeOut,
+                child: RefreshIndicator(
+                  onRefresh: _refresh,
+                  color: scheme.primary,
+                  child: ListView.separated(
+                    physics: const AlwaysScrollableScrollPhysics(
+                      parent: BouncingScrollPhysics(),
+                    ),
+                    itemCount: models.length,
+                    separatorBuilder: (_, i) => const Divider(indent: 48),
+                    itemBuilder: (context, i) => _ModelRow(
+                      rank: i + 1,
+                      model: models[i],
+                      feed: _feed,
+                      onTap: () => _showDetail(context, models[i]),
+                    ),
+                  ),
+                ),
               ),
             ),
-          );
-        },
-      ),
+          ],
+        );
+      }),
     );
   }
 
@@ -509,7 +560,7 @@ class _ModelRow extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             SizedBox(
-              width: 28,
+              width: 22,
               child: Padding(
                 padding: const EdgeInsets.only(top: 1),
                 child: Text(
@@ -524,7 +575,7 @@ class _ModelRow extends StatelessWidget {
                 ),
               ),
             ),
-            const SizedBox(width: 12),
+            const SizedBox(width: 10),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
