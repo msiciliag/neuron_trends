@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:ui' show lerpDouble;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -200,6 +201,7 @@ String paramsLabel(int n) {
 }
 
 String bytesLabel(int n) {
+  if (n >= (1 << 30) * 1024) return '${(n / ((1 << 30) * 1024)).toStringAsFixed(2)} TB';
   if (n >= 1 << 30) return '${(n / (1 << 30)).toStringAsFixed(1)} GB';
   if (n >= 1 << 20) return '${(n / (1 << 20)).toStringAsFixed(0)} MB';
   return '${(n / 1024).toStringAsFixed(0)} kB';
@@ -634,34 +636,27 @@ class _ModelDetailPageState extends State<ModelDetailPage> {
         model.tags.where((t) => !t.contains(':')).take(16).toList();
 
     return Scaffold(
-      appBar: AppBar(
-        title: Text(model.name,
-            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.open_in_new, size: 20),
-            tooltip: 'Open on Hugging Face',
-            onPressed: () =>
-                launchUrl(model.url, mode: LaunchMode.externalApplication),
+      body: CustomScrollView(
+        slivers: [
+          SliverAppBar(
+            pinned: true,
+            expandedHeight: 116,
+            backgroundColor: scheme.surface,
+            surfaceTintColor: Colors.transparent,
+            actions: [
+              IconButton(
+                icon: const Icon(Icons.open_in_new, size: 20),
+                tooltip: 'Open on Hugging Face',
+                onPressed: () =>
+                    launchUrl(model.url, mode: LaunchMode.externalApplication),
+              ),
+            ],
+            flexibleSpace: _CollapsingTitle(owner: model.owner, name: model.name),
           ),
-        ],
-      ),
-      body: ListView(
-        padding: const EdgeInsets.fromLTRB(20, 4, 20, 32),
-        children: [
-          Text(model.owner,
-              style: TextStyle(fontSize: 14, color: scheme.onSurfaceVariant)),
-          Text(
-            model.name,
-            style: TextStyle(
-              fontSize: 24,
-              fontWeight: FontWeight.w800,
-              letterSpacing: -0.5,
-              height: 1.2,
-              color: scheme.onSurface,
-            ),
-          ),
-          const SizedBox(height: 12),
+          SliverPadding(
+            padding: const EdgeInsets.fromLTRB(20, 8, 20, 32),
+            sliver: SliverList(
+              delegate: SliverChildListDelegate([
           Row(
             children: [
               _Stat(
@@ -779,6 +774,64 @@ class _ModelDetailPageState extends State<ModelDetailPage> {
               );
             },
           ),
+              ]),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Owner + model name that shrink from a large header into the pinned app bar.
+class _CollapsingTitle extends StatelessWidget {
+  final String owner;
+  final String name;
+
+  const _CollapsingTitle({required this.owner, required this.name});
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final settings =
+        context.dependOnInheritedWidgetOfExactType<FlexibleSpaceBarSettings>()!;
+    // 1.0 fully expanded -> 0.0 collapsed into the toolbar
+    final t = ((settings.currentExtent - settings.minExtent) /
+            (settings.maxExtent - settings.minExtent))
+        .clamp(0.0, 1.0);
+    return Container(
+      alignment: Alignment.bottomLeft,
+      padding: EdgeInsets.only(
+        left: lerpDouble(56, 20, t)!,
+        right: 56,
+        bottom: lerpDouble(7, 12, t)!,
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            owner,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontSize: lerpDouble(11, 14, t),
+              height: 1.2,
+              color: scheme.onSurfaceVariant,
+            ),
+          ),
+          Text(
+            name,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontSize: lerpDouble(15, 24, t),
+              fontWeight: FontWeight.w800,
+              letterSpacing: -0.5,
+              height: 1.2,
+              color: scheme.onSurface,
+            ),
+          ),
         ],
       ),
     );
@@ -820,6 +873,8 @@ MarkdownStyleSheet _markdownStyle(ColorScheme scheme) {
     ),
     blockquotePadding: const EdgeInsets.fromLTRB(12, 4, 0, 4),
     listBullet: TextStyle(fontSize: 14.5, color: scheme.onSurface),
+    // natural column widths + automatic horizontal scroll for wide tables
+    tableColumnWidth: const IntrinsicColumnWidth(),
     tableHead: TextStyle(fontWeight: FontWeight.w700, fontSize: 12.5, color: scheme.onSurface),
     tableBody: TextStyle(fontSize: 12.5, color: scheme.onSurface),
     tableBorder: TableBorder.all(color: scheme.outlineVariant, width: 0.5),
