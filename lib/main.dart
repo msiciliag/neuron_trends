@@ -5,9 +5,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
-void main() => runApp(const NeuronTrendsApp());
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await LikesStore.init();
+  runApp(const NeuronTrendsApp());
+}
 
 // ---------------------------------------------------------------------------
 // Data
@@ -39,6 +44,18 @@ class HfModel {
   String get owner => id.contains('/') ? id.split('/').first : '';
   String get name => id.contains('/') ? id.split('/').last : id;
   Uri get url => Uri.parse('https://huggingface.co/$id');
+
+  /// Round-trips through [HfModel.fromJson] (license is derived from tags).
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'likes': likes,
+        'downloads': downloads,
+        'trendingScore': trendingScore,
+        'pipeline_tag': pipelineTag,
+        'library_name': library,
+        'createdAt': createdAt?.toIso8601String(),
+        'tags': tags,
+      };
 
   factory HfModel.fromJson(Map<String, dynamic> json) {
     final tags = (json['tags'] as List? ?? []).cast<String>();
@@ -160,11 +177,47 @@ Future<String> fetchReadme(String id) async {
 enum Feed {
   trending('Trending', 'trendingScore'),
   top('Top', 'likes'),
-  fresh('New', 'createdAt');
+  fresh('New', 'createdAt'),
+  saved('Saved', ''); // local, no network
 
   const Feed(this.label, this.sortKey);
   final String label;
   final String sortKey;
+}
+
+// ---------------------------------------------------------------------------
+// Saved models — persisted snapshots so the Saved feed works offline.
+// ---------------------------------------------------------------------------
+
+class LikesStore {
+  static const _key = 'liked_models';
+  static late SharedPreferences _prefs;
+
+  /// Liked model ids; listen to this to react to changes.
+  static final ValueNotifier<Set<String>> ids = ValueNotifier(const {});
+
+  static Future<void> init() async {
+    _prefs = await SharedPreferences.getInstance();
+    ids.value = all().map((m) => m.id).toSet();
+  }
+
+  static bool isLiked(String id) => ids.value.contains(id);
+
+  static List<HfModel> all() => [
+        for (final s in _prefs.getStringList(_key) ?? const [])
+          HfModel.fromJson(jsonDecode(s) as Map<String, dynamic>)
+      ];
+
+  static void toggle(HfModel model) {
+    final entries = all();
+    if (isLiked(model.id)) {
+      entries.removeWhere((m) => m.id == model.id);
+    } else {
+      entries.insert(0, model);
+    }
+    _prefs.setStringList(_key, [for (final m in entries) jsonEncode(m.toJson())]);
+    ids.value = entries.map((m) => m.id).toSet();
+  }
 }
 
 Future<List<HfModel>> fetchModels(Feed feed) async {
@@ -328,10 +381,31 @@ class _FeedPageState extends State<FeedPage> {
   @override
   void initState() {
     super.initState();
+    LikesStore.ids.addListener(_onLikesChanged);
     _load();
   }
 
+  void _onLikesChanged() {
+    if (_feed == Feed.saved && mounted) {
+      setState(() => _models = LikesStore.all());
+    }
+  }
+
+  @override
+  void dispose() {
+    LikesStore.ids.removeListener(_onLikesChanged);
+    super.dispose();
+  }
+
   Future<void> _load() async {
+    if (_feed == Feed.saved) {
+      setState(() {
+        _models = LikesStore.all();
+        _loading = false;
+        _failed = false;
+      });
+      return;
+    }
     final id = ++_reqId;
     setState(() {
       _loading = true;
@@ -433,6 +507,26 @@ class _FeedPageState extends State<FeedPage> {
                       strokeWidth: 2.5, color: hfYellow),
                 );
         }
+        if (models.isEmpty && _feed == Feed.saved) {
+          return Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.favorite_border, size: 40, color: hfYellow),
+                const SizedBox(height: 12),
+                Text('Nothing saved yet',
+                    style: TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600,
+                        color: scheme.onSurface)),
+                const SizedBox(height: 4),
+                Text('Hold a model and slide it right to save it',
+                    style: TextStyle(
+                        fontSize: 13, color: scheme.onSurfaceVariant)),
+              ],
+            ),
+          );
+        }
         // keep the previous list on screen while a new feed loads: dim it
         // slightly instead of flashing a spinner
         return Column(
@@ -458,11 +552,14 @@ class _FeedPageState extends State<FeedPage> {
                     ),
                     itemCount: models.length,
                     separatorBuilder: (_, i) => const Divider(),
-                    itemBuilder: (context, i) => _ModelRow(
-                      rank: i + 1,
+                    itemBuilder: (context, i) => _SlideToLike(
                       model: models[i],
-                      feed: _feed,
-                      onTap: () => _showDetail(context, models[i]),
+                      child: _ModelRow(
+                        rank: i + 1,
+                        model: models[i],
+                        feed: _feed,
+                        onTap: () => _showDetail(context, models[i]),
+                      ),
                     ),
                   ),
                 ),
@@ -526,6 +623,102 @@ class _FeedChip extends StatelessWidget {
 }
 
 // ---------------------------------------------------------------------------
+// Hold-and-slide-right to save. The tile slides as an opaque surface over a
+// fixed yellow background; crossing 20% of the width toggles the like.
+// Sliding further is reserved for future actions.
+// ---------------------------------------------------------------------------
+
+class _SlideToLike extends StatefulWidget {
+  final HfModel model;
+  final Widget child;
+
+  const _SlideToLike({required this.model, required this.child});
+
+  @override
+  State<_SlideToLike> createState() => _SlideToLikeState();
+}
+
+class _SlideToLikeState extends State<_SlideToLike>
+    with SingleTickerProviderStateMixin {
+  static const _threshold = 0.20; // fraction of width that toggles the like
+
+  late final AnimationController _settle = AnimationController(
+      vsync: this, duration: const Duration(milliseconds: 220))
+    ..addListener(() => setState(() {}));
+  Animation<double>? _settleAnim;
+  double _dx = 0;
+  bool _pastThreshold = false;
+
+  double get _offset => _settleAnim?.value ?? _dx;
+
+  @override
+  void dispose() {
+    _settle.dispose();
+    super.dispose();
+  }
+
+  void _end(double width) {
+    if (_dx >= width * _threshold) {
+      HapticFeedback.heavyImpact();
+      LikesStore.toggle(widget.model);
+    }
+    _settleAnim = Tween<double>(begin: _dx, end: 0)
+        .animate(CurvedAnimation(parent: _settle, curve: Curves.easeOutCubic));
+    _dx = 0;
+    _pastThreshold = false;
+    _settle.forward(from: 0).then((_) => _settleAnim = null);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return LayoutBuilder(builder: (context, constraints) {
+      final width = constraints.maxWidth;
+      final progress = (_offset / (width * _threshold)).clamp(0.0, 1.0);
+      final liked = LikesStore.isLiked(widget.model.id);
+      return GestureDetector(
+        onLongPressStart: (_) => HapticFeedback.mediumImpact(),
+        onLongPressMoveUpdate: (d) {
+          final dx = d.offsetFromOrigin.dx.clamp(0.0, width * 0.30);
+          if (dx >= width * _threshold != _pastThreshold) {
+            _pastThreshold = dx >= width * _threshold;
+            HapticFeedback.selectionClick();
+          }
+          setState(() => _dx = dx);
+        },
+        onLongPressEnd: (_) => _end(width),
+        onLongPressCancel: () => _end(width),
+        child: Stack(
+          children: [
+            Positioned.fill(
+              child: Container(
+                color: hfYellow,
+                alignment: Alignment.centerLeft,
+                padding: const EdgeInsets.only(left: 20),
+                child: Transform.scale(
+                  scale: 0.5 + 0.6 * progress,
+                  child: Icon(
+                    progress >= 1
+                        ? (liked ? Icons.heart_broken : Icons.favorite)
+                        : (liked ? Icons.heart_broken_outlined : Icons.favorite_border),
+                    color: Colors.black,
+                    size: 22,
+                  ),
+                ),
+              ),
+            ),
+            Transform.translate(
+              offset: Offset(_offset, 0),
+              child: ColoredBox(color: scheme.surface, child: widget.child),
+            ),
+          ],
+        ),
+      );
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Row — HN-style: rank, title, meta line. Text only: no avatars, no images.
 // ---------------------------------------------------------------------------
 
@@ -548,8 +741,7 @@ class _ModelRow extends StatelessWidget {
     final tagColor = pipelineColor(model.pipelineTag, scheme.brightness);
     final score = switch (feed) {
       Feed.trending => model.trendingScore,
-      Feed.top => model.likes,
-      Feed.fresh => model.likes,
+      Feed.top || Feed.fresh || Feed.saved => model.likes,
     };
 
     return InkWell(
@@ -644,14 +836,29 @@ class _ModelRow extends StatelessWidget {
             const SizedBox(width: 12),
             Padding(
               padding: const EdgeInsets.only(top: 2),
-              child: Text(
-                '↓ ${compact(model.downloads)}',
-                style: TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.w600,
-                  fontFeatures: const [FontFeature.tabularFigures()],
-                  color: scheme.onSurfaceVariant,
-                ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Text(
+                    '↓ ${compact(model.downloads)}',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                      color: scheme.onSurfaceVariant,
+                    ),
+                  ),
+                  ValueListenableBuilder<Set<String>>(
+                    valueListenable: LikesStore.ids,
+                    builder: (_, ids, child) => ids.contains(model.id)
+                        ? const Padding(
+                            padding: EdgeInsets.only(top: 5),
+                            child:
+                                Icon(Icons.favorite, size: 13, color: hfYellow),
+                          )
+                        : const SizedBox.shrink(),
+                  ),
+                ],
               ),
             ),
           ],
@@ -695,6 +902,23 @@ class _ModelDetailPageState extends State<ModelDetailPage> {
             backgroundColor: scheme.surface,
             surfaceTintColor: Colors.transparent,
             actions: [
+              ValueListenableBuilder<Set<String>>(
+                valueListenable: LikesStore.ids,
+                builder: (_, ids, child) => IconButton(
+                  icon: Icon(
+                    ids.contains(model.id)
+                        ? Icons.favorite
+                        : Icons.favorite_border,
+                    size: 20,
+                    color: ids.contains(model.id) ? hfYellow : null,
+                  ),
+                  tooltip: 'Save',
+                  onPressed: () {
+                    HapticFeedback.selectionClick();
+                    LikesStore.toggle(model);
+                  },
+                ),
+              ),
               IconButton(
                 icon: const Icon(Icons.open_in_new, size: 20),
                 tooltip: 'Open on Hugging Face',

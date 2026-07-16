@@ -38,6 +38,27 @@ void main() {
     expect(compact(1500000), '1.5M');
   });
 
+  test('toJson round-trips for the saved-models store', () {
+    final m = HfModel.fromJson({
+      'id': 'a/b',
+      'likes': 5,
+      'downloads': 9,
+      'trendingScore': 7,
+      'pipeline_tag': 'text-generation',
+      'library_name': 'llama.cpp',
+      'createdAt': '2026-07-04T00:24:01.000Z',
+      'tags': ['gguf', 'license:mit'],
+    });
+    final r = HfModel.fromJson(m.toJson());
+    expect(r.id, m.id);
+    expect(r.likes, m.likes);
+    expect(r.trendingScore, m.trendingScore);
+    expect(r.pipelineTag, m.pipelineTag);
+    expect(r.library, m.library);
+    expect(r.license, 'mit');
+    expect(r.createdAt, m.createdAt);
+  });
+
   test('detail parsing: quants, params, gated', () {
     final d = HfModelDetail.fromJson({
       'gguf': {'total': 3645856513, 'architecture': 'dspark', 'context_length': 4096},
