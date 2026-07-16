@@ -5,6 +5,14 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
+# Version scheme: MAJOR.MINOR comes from pubspec.yaml (edit it to bump),
+# patch auto-increments with the workflow run number -> v1.0.N
+env:
+  BUILD_NUMBER: ${{ github.run_number }}
+
 jobs:
   android:
     runs-on: ubuntu-latest
@@ -20,11 +28,21 @@ jobs:
           channel: stable
           cache: true
       - run: flutter test
-      - run: flutter build apk --release --split-per-abi
+      - name: Build APKs
+        run: |
+          BASE=$(sed -n 's/^version: *\([0-9]*\.[0-9]*\).*/\1/p' pubspec.yaml)
+          VERSION=$BASE.$BUILD_NUMBER
+          flutter build apk --release --split-per-abi \
+            --build-name=$VERSION --build-number=$BUILD_NUMBER
+          cd build/app/outputs/flutter-apk
+          for f in app-*-release.apk; do
+            abi=${f#app-}; abi=${abi%-release.apk}
+            mv "$f" "neuron_trends-$VERSION-$abi.apk"
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: android-apks
-          path: build/app/outputs/flutter-apk/*.apk
+          path: build/app/outputs/flutter-apk/neuron_trends-*.apk
 
   ios:
     runs-on: macos-latest
@@ -37,12 +55,34 @@ jobs:
           cache: true
       # ponytail: unsigned IPA (no Apple signing certs in CI); sideload or add
       # certs + fastlane when App Store distribution matters
-      - run: flutter build ios --release --no-codesign
-      - run: |
+      - name: Build unsigned IPA
+        run: |
+          BASE=$(sed -n 's/^version: *\([0-9]*\.[0-9]*\).*/\1/p' pubspec.yaml)
+          VERSION=$BASE.$BUILD_NUMBER
+          flutter build ios --release --no-codesign \
+            --build-name=$VERSION --build-number=$BUILD_NUMBER
           mkdir Payload
           cp -r build/ios/iphoneos/Runner.app Payload/
-          zip -qr neuron_trends-unsigned.ipa Payload
+          zip -qr neuron_trends-$VERSION-unsigned.ipa Payload
       - uses: actions/upload-artifact@v4
         with:
           name: ios-ipa-unsigned
-          path: neuron_trends-unsigned.ipa
+          path: neuron_trends-*-unsigned.ipa
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [android, ios]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BASE=$(sed -n 's/^version: *\([0-9]*\.[0-9]*\).*/\1/p' pubspec.yaml)
+          VERSION=$BASE.$BUILD_NUMBER
+          gh release create "v$VERSION" dist/* \
+            --title "neuron trends v$VERSION" --generate-notes
